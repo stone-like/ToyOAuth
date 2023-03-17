@@ -102,7 +102,7 @@ type AccessToken struct {
 	expires_at time.Time
 }
 
-func NewAccessToken(userId, clientId string, scopes []string, redirectUri string, expires_at time.Time) *AccessToken {
+func NewAccessToken(userId, clientId string, scopes []string, expires_at time.Time) *AccessToken {
 	return &AccessToken{
 		value:      generateRandom(),
 		userId:     userId,
@@ -138,8 +138,10 @@ func checkResponseType(resonseType string) error {
 	return ErrInvalidResponseType
 }
 
+var redirectUri = "http://example.com"
+
 var clientStore = []*Client{
-	NewClient("1", "MyClient", []string{"http://localhost:8080/auth"}),
+	NewClient("1", "MyClient", []string{redirectUri}),
 }
 
 var userStore = []*User{
@@ -152,7 +154,7 @@ var accessTokenStore = make(map[string]*AccessToken)
 
 const (
 	AUTHORIZATION_CODE_DURATION = 600
-	ACCESS_TOKEN_DURAATION      = 86400
+	ACCESS_TOKEN_DURATION       = 86400
 )
 
 func lookUpClient(clientId string) (*Client, bool) {
@@ -177,43 +179,43 @@ func AuthorizeCode(c *gin.Context) {
 	session := sessions.Default(c)
 
 	//clientId
-	clientId, exists := c.GetQuery("clientId")
+	clientId, exists := c.GetQuery("client_id")
 
 	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"msg": "clientId not extsts"})
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "client_id not extsts"})
 		return
 	}
 
 	client, exists := lookUpClient(clientId)
 	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"msg": "clientId is wrong"})
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "client_id is wrong"})
 		return
 	}
 
 	//redirectUri
-	redirectUri, exists := c.GetQuery("redirectUri")
+	redirectUri, exists := c.GetQuery("redirect_uri")
 
 	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"msg": "redirectUri not exists"})
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "redirect_uri not exists"})
 		return
 	}
 
 	if !client.isValidRedirectUri(redirectUri) {
-		c.JSON(http.StatusBadRequest, gin.H{"msg": "redirectUri is wrong"})
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "redirect_uri is wrong"})
 		return
 	}
 
 	//responce_type
 	//今回は認可コードフローのみ実装
-	responseType, exists := c.GetQuery("responseType")
+	responseType, exists := c.GetQuery("response_type")
 
 	if !exists {
-		c.JSON(http.StatusBadRequest, gin.H{"msg": "responseType not exists"})
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "response_type not exists"})
 		return
 	}
 
 	if err := checkResponseType(responseType); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"msg": "responseType is wrong"})
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "response_type is wrong"})
 		return
 	}
 
@@ -285,7 +287,7 @@ func Decision(c *gin.Context) {
 	err := json.Unmarshal(clientBytes, client)
 	if err != nil {
 		c.Redirect(http.StatusFound, customRedirectLocation(
-			"http://localhost:8080",
+			redirectUri,
 			map[string]string{
 				"error":             "access_denied",
 				"error_description": "marshal error",
@@ -297,7 +299,7 @@ func Decision(c *gin.Context) {
 	scopeString, ok := session.Get("state").(string)
 	if !ok {
 		c.Redirect(http.StatusFound, customRedirectLocation(
-			"http://localhost:8080",
+			redirectUri,
 			map[string]string{
 				"error":             "access_denied",
 				"error_description": "session storage error",
@@ -315,7 +317,7 @@ func Decision(c *gin.Context) {
 	_, exists := c.GetPostForm("approved")
 	if !exists {
 		c.Redirect(http.StatusFound, customRedirectLocation(
-			"http://localhost:8080h",
+			redirectlocation,
 			map[string]string{
 				"error":             "access_denied",
 				"error_description": "The request was not approved",
@@ -352,8 +354,85 @@ func Decision(c *gin.Context) {
 
 }
 
+func GetPostParam(c *gin.Context, param string) (string, error) {
+	value, exists := c.GetPostForm(param)
+	if !exists {
+		return "", fmt.Errorf("invalid request,%s is missing", param)
+	}
+
+	return value, nil
+}
+
 func Token(c *gin.Context) {
-	fmt.Println("Token")
+	grantType, err := GetPostParam(c, "grant_type")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": err.Error()})
+		return
+	}
+
+	//ここenumとかでチェックした方が良いし、マジックナンバー(マジックストリング)は使わない方がいい
+	if grantType != "authorization_code" {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "unsupported grant type"})
+		return
+	}
+
+	codeValue, err := GetPostParam(c, "code")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": err.Error()})
+		return
+	}
+
+	code, exists := authorizationCodeStore[codeValue]
+	if !exists {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "autorization code is wrong"})
+		return
+	}
+
+	if code.expires_at.After(time.Now()) {
+		delete(authorizationCodeStore, codeValue)
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "autorization code has already expied"})
+		return
+	}
+
+	redirectUri, err := GetPostParam(c, "redirect_uri")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": err.Error()})
+		return
+	}
+
+	if redirectUri != code.redirectUri {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "redirect_uri is wrong"})
+		return
+	}
+
+	clientId, err := GetPostParam(c, "client_id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": err.Error()})
+		return
+	}
+
+	if clientId != code.clientId {
+		c.JSON(http.StatusBadRequest, gin.H{"msg": "client_id is wrong"})
+		return
+	}
+
+	//アクセストークンを生成
+	expiresAt := time.Now().Add(ACCESS_TOKEN_DURATION)
+
+	token := NewAccessToken(code.userId, code.clientId, code.scopes, expiresAt)
+	accessTokenStore[token.value] = token
+
+	//使用済みの認可コードは削除
+	delete(authorizationCodeStore, codeValue)
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token": token.value,
+		"token_type":   "Bearer",
+		"expires_in":   ACCESS_TOKEN_DURATION,
+		"scope":        strings.Join(token.scopes, " "),
+	})
+
+	return
 }
 
 func SetSession(router *gin.Engine) {
